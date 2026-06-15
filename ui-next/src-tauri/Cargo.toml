@@ -1,0 +1,25 @@
+[package]
+name = "agent-workbench-next"
+version = "0.1.0"
+description = "Modern Agent Workbench interface"
+authors = ["Agent Workbench contributors"]
+edition = "2021"
+
+[lib]
+name = "agent_workbench_next_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+shellexpand = "3"
+portable-pty = "0.9"
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+time = { version = "=0.3.47", features = ["formatting"] }
+uuid = { version = "1", features = ["v4"] }

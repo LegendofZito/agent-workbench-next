@@ -1,0 +1,44 @@
+# Node
+node_modules/
+.pnpm-store/
+
+# Rust / Tauri build artifacts
+**/target/
+
+# SvelteKit generated output
+.svelte-kit/
+build/
+dist/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Secrets and environment
+secrets.json
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*~
+
+# Aider AI coding tool
+.aider*
+
+# macOS
+.DS_Store
+
+# KDE / Linux desktop
+.directory
+
+# Temporary dev documentation (not for public repo)
+HANDOFF-FOR-CODEX*.md
+BUILD-SPEC*.md
+tmp/
