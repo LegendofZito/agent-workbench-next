@@ -28,6 +28,7 @@
     onremovequeue,
     onpasteimage,
     ondraft,
+    onqueue,
   }: {
     workspaceId: string;
     draft?: string;
@@ -47,6 +48,7 @@
     onremovequeue: (index: number) => void;
     onpasteimage: () => void;
     ondraft: (text: string) => void;
+    onqueue?: (text: string) => void;
   } = $props();
 
   let prompt = $state("");
@@ -58,6 +60,14 @@
     const text = prompt.trim();
     if (!text && attachments.length === 0) return;
     onsend(text);
+    prompt = "";
+    ondraft("");
+  }
+
+  function queueDraft() {
+    const text = prompt.trim();
+    if (!text) return;
+    onqueue?.(text);
     prompt = "";
     ondraft("");
   }
@@ -173,6 +183,17 @@
           <button class="stop-button" onclick={onstop} aria-label="Stop active turn">
             <Square size={14} fill="currentColor" />
             Stop
+          </button>
+        {/if}
+        {#if onqueue && !busy}
+          <button
+            class="queue-button"
+            onclick={queueDraft}
+            disabled={!prompt.trim()}
+            aria-label="Add to queue"
+            title="Add to queue — runs after current turn finishes"
+          >
+            Queue
           </button>
         {/if}
         <button

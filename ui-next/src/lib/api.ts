@@ -519,6 +519,36 @@ export async function maybeAutoDeployHandoff(
   });
 }
 
+export async function spawnWorker(input: {
+  source_id: string;
+  prompt: string;
+  agent?: string;
+  model?: string;
+  effort?: string;
+}): Promise<Session> {
+  const response = await fetch(`${SEND_SERVER}/worker/spawn`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const raw = (await response.json()) as {
+    ok?: boolean;
+    session?: Record<string, unknown>;
+    error?: string;
+  };
+  if (!response.ok || !raw.ok || !raw.session) {
+    throw new Error(raw.error || "Could not spawn worker session");
+  }
+  const sess = raw.session;
+  const backend = sess["backend"] as Record<string, unknown> | undefined;
+  return sessionFromRecord(sess, {
+    agent: String(sess["agent"] ?? input.agent ?? "claude"),
+    model: String(backend?.["model"] ?? input.model ?? "Default"),
+    effort: String(backend?.["effort"] ?? input.effort ?? "Default"),
+    cwd: String(sess["cwd"] ?? ""),
+  });
+}
+
 export async function serverInfo(): Promise<ServerInfo> {
   try {
     const response = await fetchWithTimeout(`${SEND_SERVER}/health`, {}, 2_000);
@@ -631,7 +661,7 @@ export async function sendMessage(
   attachments: string[],
   onDelta: (text: string) => void,
   onMeta?: (backend: string, model: string) => void,
-  onWork?: (type: string, content: string) => void,
+  onWork?: (type: string, content: string, id?: string) => void,
   signal?: AbortSignal,
 ): Promise<SendResult> {
   let response: Response;
@@ -690,6 +720,7 @@ export async function sendMessage(
         onWork?.(
           String(event["kind"] ?? "system"),
           String(event["content"] ?? ""),
+          event["id"] !== undefined ? String(event["id"]) : undefined,
         );
       } else if (type === "usage") {
         tokenUsage = {

@@ -65,6 +65,20 @@ CONNECTOR_CACHE = {"time": 0.0, "value": []}
 CONNECTOR_CACHE_SECONDS = 15
 HANDOFF_WARNING_PERCENT = 70
 HANDOFF_MAX_CHARS = 60_000
+
+# ---------------------------------------------------------------------------
+# Worker / sub-agent spawn support
+# ---------------------------------------------------------------------------
+# Ordered cheapest-first preferred models per backend for spawned workers.
+PREFERRED_WORKER_MODELS = {
+    "claude": ["sonnet", "haiku", "Default"],
+    "codex": ["gpt-5.4-mini", "gpt-5.4"],
+    "gemini": ["gemini-3-flash-preview"],
+}
+# Per-source dedup: maps source_session_id → set of request_signature hashes.
+# Keyed in memory only; cleared on server restart (acceptable — same as OG).
+_WORKER_SPAWN_HASHES: dict = {}
+_WORKER_SPAWN_LOCK = threading.Lock()
 CLAUDE_SMART_ORCHESTRATION_PROMPT = """
 Agent Workbench orchestration policy:
 
@@ -115,6 +129,15 @@ CLAUDE_SMART_AGENTS = {
     },
 }
 CLAUDE_SMART_AGENTS_JSON = json.dumps(CLAUDE_SMART_AGENTS, separators=(",", ":"))
+
+
+def preferred_worker_model(agent):
+    """Return the first (cheapest) model from PREFERRED_WORKER_MODELS for *agent*.
+
+    Falls back to "Default" for unrecognised backends.
+    """
+    entries = PREFERRED_WORKER_MODELS.get(clean_text(agent) or "", [])
+    return entries[0] if entries else "Default"
 
 
 def now_iso():
@@ -1237,13 +1260,23 @@ def structured_handoff_packet(session):
     agent = clean_text(session.get("agent") or "agent").title()
     cwd = clean_text(session.get("cwd") or os.path.expanduser("~"))
     context = session.get("context") or {}
-    requests = []
-    conclusions = []
+
+    first_user_request = ""
+    last_agent_conclusion = ""
     upgrades = []
     failures = []
     unresolved = []
-    technical = []
-    chronology = []
+    commands = []
+    file_changes = []
+    decisions = []
+
+    def last_line(text):
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        return lines[-1] if lines else text.strip()
+
+    def truncate(text, limit=160):
+        text = re.sub(r"\s+", " ", clean_text(text)).strip()
+        return text[:limit - 1].rstrip() + "…" if len(text) > limit else text
 
     for turn_index, turn in enumerate(session.get("turns") or [], start=1):
         user_texts = []
@@ -1255,37 +1288,121 @@ def structured_handoff_packet(session):
                 continue
             if kind == "userMessage":
                 user_texts.append(text)
-                requests.append(text)
-                chronology.append(f"{turn_index}. USER: {text}")
+                if not first_user_request:
+                    first_user_request = truncate(text, 300)
             elif kind == "agentMessage":
                 agent_texts.append(text)
-                conclusions.append(text)
-                chronology.append(f"{turn_index}. AGENT: {text}")
+                last_agent_conclusion = text
                 lowered = text.lower()
                 if re.search(
                     r"\b(added|built|implemented|upgraded|updated|fixed|created|installed|changed|wired|enabled|completed|now supports)\b",
                     lowered,
                 ):
-                    upgrades.append(text)
+                    upgrades.append(truncate(last_line(text)))
                 if re.search(
                     r"\b(failed|failure|error|blocked|unable|could not|couldn't|timeout|timed out|stalled|broken|regression)\b",
                     lowered,
                 ):
-                    failures.append(text)
+                    failures.append(truncate(last_line(text)))
                 if re.search(
                     r"\b(todo|remaining|unresolved|not yet|still needs|follow[- ]?up|deferred|later|next step|open question)\b",
                     lowered,
                 ):
-                    unresolved.append(text)
-            elif kind in {"commandExecution", "fileChange", "plan", "note", "report"}:
-                technical.append(f"{kind.upper()}: {text}")
+                    unresolved.append(truncate(last_line(text)))
+                if re.search(
+                    r"\b(decided|decision|chose|choosing|approach|strategy|will use|going with)\b",
+                    lowered,
+                ):
+                    decisions.append(truncate(last_line(text)))
+            elif kind == "commandExecution":
+                commands.append(truncate(text))
+            elif kind == "fileChange":
+                file_changes.append(truncate(text))
+            elif kind == "plan":
+                decisions.append(truncate(last_line(text)))
+            elif kind in {"note", "report"}:
+                if text.startswith("ERROR:"):
+                    failures.append(truncate(f"Turn {turn_index}: {text}"))
         if user_texts and not agent_texts:
-            unresolved.extend(user_texts)
+            unresolved.append(truncate(last_line(user_texts[-1])))
         if turn.get("status") not in {None, "completed"}:
-            failures.append(
+            failures.append(truncate(
                 f"Turn {turn_index} ended as {turn.get('status')}: "
-                f"{clean_text(turn.get('prompt')) or 'Turn had no saved prompt.'}"
-            )
+                f"{clean_text(turn.get('prompt')) or 'no prompt'}"
+            ))
+
+    def detect_project_commands(cwd):
+        """Return (bullets: list[str], is_software_project: bool) for the project at cwd."""
+        result = []
+        is_software = False
+        if not cwd or not os.path.isdir(cwd):
+            result += [
+                f'cd "{cwd or os.path.expanduser("~")}"',
+                "git status",
+                "git log --oneline -10",
+                "ls",
+            ]
+            return result, False
+
+        pkg_json = os.path.join(cwd, "package.json")
+        if os.path.isfile(pkg_json):
+            is_software = True
+            try:
+                with open(pkg_json, encoding="utf-8") as fh:
+                    pkg = json.load(fh)
+            except Exception:
+                pkg = {}
+            scripts = pkg.get("scripts") or {}
+            deps_all = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+            script_text = json.dumps(scripts).lower()
+            has_tauri = os.path.isdir(os.path.join(cwd, "src-tauri")) or "tauri" in script_text or "tauri" in " ".join(deps_all).lower()
+            result.append("pnpm install — install deps")
+            for name, desc in [("dev", "start dev server"), ("build", "production build"),
+                                ("test", "run tests"), ("check", "type-check"),
+                                ("lint", "lint code")]:
+                if name in scripts:
+                    result.append(f"pnpm {name} — {desc}")
+            if has_tauri:
+                result.append("pnpm tauri dev — launch Tauri desktop app")
+                result.append("pnpm tauri build — build distributable")
+
+        cargo = os.path.join(cwd, "Cargo.toml")
+        if os.path.isfile(cargo):
+            is_software = True
+            result += ["cargo build — compile", "cargo test — run tests", "cargo run — run binary"]
+
+        has_py = os.path.isfile(os.path.join(cwd, "pyproject.toml")) or \
+                 os.path.isfile(os.path.join(cwd, "requirements.txt")) or \
+                 any(f.endswith(".py") for f in (os.listdir(cwd) if os.path.isdir(cwd) else []))
+        if has_py:
+            is_software = True
+            if os.path.isfile(os.path.join(cwd, "pyproject.toml")):
+                result.append("python3 -m pytest — run tests")
+            else:
+                result.append("python3 <script>.py — run entry point")
+
+        result += [f'cd "{cwd}"', "git status", "git log --oneline -10", "ls"]
+        # Cap to 6 most relevant; dedupe
+        seen, final = set(), []
+        for item in result:
+            k = item.lower().strip()
+            if k not in seen:
+                seen.add(k)
+                final.append(item)
+            if len(final) >= 6:
+                break
+        return final, is_software
+
+    last_conclusion_line = truncate(last_line(last_agent_conclusion), 300) if last_agent_conclusion else "No agent response recorded."
+    overview_goal = first_user_request or "No user request recorded."
+    overview = f"Goal: {overview_goal}\nState: {last_conclusion_line}"
+
+    # Current status: what's being built + latest turn outcome
+    last_turn = (session.get("turns") or [{}])[-1]
+    last_turn_status = last_turn.get("status") or "completed"
+    last_action = truncate(last_line(last_agent_conclusion), 200) if last_agent_conclusion else "No agent response recorded."
+    outcome_note = "" if last_turn_status in {None, "completed"} else f" (last turn ended: {last_turn_status})"
+    current_status = f"Working on: {overview_goal}\nLatest: {last_action}{outcome_note}"
 
     used = int(context.get("used") or 0)
     limit = int(context.get("limit") or 0)
@@ -1294,6 +1411,8 @@ def structured_handoff_packet(session):
         if used > 0 and limit > 0
         else "unknown"
     )
+
+    cmd_bullets, is_sw_project = detect_project_commands(cwd)
     parts = [
         "# Automatic Session Handoff",
         f"- Source title: {title}",
@@ -1302,46 +1421,21 @@ def structured_handoff_packet(session):
         f"- Source context usage: {context_line}",
         f"- Generated: {now_iso()}",
         "",
-        handoff_section("User Goals And Requests", requests, limit=80, item_limit=900),
+        f"## Overview\n{overview}",
         "",
-        handoff_section(
-            "Decisions And Important Conclusions",
-            conclusions[-40:],
-            limit=40,
-            item_limit=1200,
-        ),
+        f"## Current status\n{current_status}",
         "",
-        handoff_section(
-            "Upgrades And Completed Changes",
-            upgrades[-30:],
-            limit=30,
-            item_limit=1200,
-        ),
+        handoff_section("What went right", upgrades[-12:], item_limit=160),
         "",
-        handoff_section(
-            "Failures, Dead Ends, And Blockers",
-            failures[-30:],
-            limit=30,
-            item_limit=1200,
-        ),
+        handoff_section("What went wrong / blockers", failures[-12:], item_limit=160),
         "",
-        handoff_section(
-            "Unresolved Questions And Forgotten Follow-Ups",
-            unresolved[-40:],
-            limit=40,
-            item_limit=1000,
-        ),
+        handoff_section("Updates applied", (file_changes + commands)[-12:], item_limit=160),
         "",
-        handoff_section(
-            "Important Technical Details",
-            technical[-60:],
-            limit=60,
-            item_limit=800,
-        ),
+        handoff_section("Key decisions", decisions[-12:], item_limit=160),
         "",
-        "## Chronological Conversation Record",
-        "\n".join(unique_handoff_values(chronology[-80:], item_limit=700))
-        or "- No conversation text was available.",
+        handoff_section("Open items & next steps", unresolved[-12:], item_limit=160),
+        "",
+        "## Useful commands\n" + "\n".join(f"- {b}" for b in cmd_bullets),
         "",
         "## Continuation Instructions",
         "- Treat this packet as authoritative context from the previous session.",
@@ -1349,7 +1443,7 @@ def structured_handoff_packet(session):
         "- Address unresolved items when they are relevant, even if the prior conversation moved on.",
         "- Inspect the current filesystem before assuming recorded file state is still current.",
         "- Continue the user's latest objective directly after a brief acknowledgment.",
-    ]
+    ] + (["- Before changing anything, orient yourself in the program — read its structure, run `git status`, and run the build/check command listed above — so you know the current state before acting."] if is_sw_project else [])
     packet = "\n".join(parts)
     if len(packet) > HANDOFF_MAX_CHARS:
         packet = packet[: HANDOFF_MAX_CHARS - 160].rstrip() + (
@@ -1409,6 +1503,7 @@ def stage_handoff(session, force=False):
 
 
 def all_sessions():
+    """Return every local session, including worker sessions."""
     sessions = []
     try:
         names = os.listdir(SESS_DIR)
@@ -1421,6 +1516,23 @@ def all_sessions():
         if isinstance(session, dict):
             sessions.append(session)
     return sessions
+
+
+def user_sessions():
+    """Return only non-worker sessions for the main session list.
+
+    Mirrors OG ~line 8470: spawnees (``worker_parent_session_id`` set) live in
+    the per-session Spawned tab and must not clutter the primary list.
+    """
+    return [s for s in all_sessions() if not s.get("worker_parent_session_id")]
+
+
+def worker_sessions(parent_id):
+    """Return all worker sessions whose parent is *parent_id*."""
+    return [
+        s for s in all_sessions()
+        if s.get("worker_parent_session_id") == parent_id
+    ]
 
 
 def next_handoff_title(source):
@@ -1560,6 +1672,94 @@ def maybe_auto_deploy_handoff(source_id):
         effort,
         automatic=True,
     )
+
+
+def spawn_worker_session(source_id, prompt, agent=None, model=None, effort=None):
+    """Create a new bounded worker session seeded with *prompt*.
+
+    Mirrors OG ``spawn_worker_job`` (OG ~line 9487). Returns the new session
+    dict.  Raises ``ValueError`` on dedup hit or bad inputs.
+
+    SHA-256 dedup key: ``source_id|prompt|agent|model|effort`` — if the same
+    tuple was already spawned for *source_id* this server run the existing
+    session is returned instead of creating a duplicate.
+    """
+    source = load_session(source_id)
+    # Resolve defaults
+    agent = clean_text(agent) or clean_text(source.get("agent")) or "claude"
+    model = clean_text(model) or preferred_worker_model(agent)
+    effort = clean_text(effort) or "low"
+    prompt = clean_text(prompt) or ""
+    if not prompt:
+        raise ValueError("spawn_worker_session: prompt is required")
+
+    # --- SHA-256 dedup ---
+    sig_raw = "\0".join([source_id, prompt, agent, model, effort])
+    request_signature = hashlib.sha256(sig_raw.encode("utf-8")).hexdigest()
+    with _WORKER_SPAWN_LOCK:
+        seen = _WORKER_SPAWN_HASHES.setdefault(source_id, set())
+        if request_signature in seen:
+            # Find the existing session that carries this signature
+            for s in all_sessions():
+                if s.get("worker_request_signature") == request_signature:
+                    return s
+        seen.add(request_signature)
+
+    # --- Build packet (not context-gated — workers always get a packet) ---
+    packet = structured_handoff_packet(source)
+
+    # --- Create new session ---
+    job_id = str(uuid.uuid4())
+    timestamp = now_iso()
+    title, base_title, sequence = next_handoff_title(source)
+    backend: dict = {"model": model}
+    if agent != "gemini" and effort and effort != "Default":
+        backend["effort"] = effort
+
+    target_artifact = os.path.join(artifact_session_dir(job_id), "HANDOFF.md")
+    os.makedirs(os.path.dirname(target_artifact), exist_ok=True)
+    Path(target_artifact).write_text(packet, encoding="utf-8")
+
+    session = {
+        "id": job_id,
+        "title": title,
+        "agent": agent,
+        "backend": backend,
+        "cwd": source.get("cwd") or os.path.expanduser("~"),
+        "origin": "local",
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "turns": [],
+        "handoff_from": source_id,
+        "handoff_base_title": base_title,
+        "handoff_sequence": sequence,
+        "handoff_artifact": target_artifact,
+        "handoff_context": (
+            f"Read the authoritative continuation handoff before acting:\n{target_artifact}"
+        ),
+        "handoff_stage_ready": True,
+        "handoff_stage_signature": handoff_signature(source),
+        "handoff_stage_artifact": target_artifact,
+        "handoff_stage_updated_at": timestamp,
+        # Worker markers (excluded from main session list)
+        "worker_job_id": job_id,
+        "worker_parent_session_id": source_id,
+        "worker_request_signature": request_signature,
+    }
+
+    # Seed first turn so the worker is ready to auto-send
+    first_turn = {
+        "id": str(uuid.uuid4()),
+        "created_at": timestamp,
+        "status": "pending",
+        "prompt": prompt,
+        "items": [
+            {"type": "userMessage", "content": [{"type": "text", "text": prompt}]}
+        ],
+    }
+    session["turns"].append(first_turn)
+    save_session(session)
+    return session
 
 
 def split_gemini_visible_text(text):
@@ -2724,6 +2924,13 @@ def stream_claude(session, user_text, model, emit, control):
     )
     process = run_process(command, session.get("cwd") or os.path.expanduser("~"), control)
     full = []
+    # Piece 2: track in-flight explicit workers so we can emit worker_done when
+    # the matching tool_result arrives.  Map tool_use_id → label string.
+    _inflight_workers: dict = {}
+    # Piece 3: model-inferred subagent tracking.
+    _primary_model: str = ""
+    _inferred_worker_id: str = ""  # "model:<model>" or "" when none active
+
     for raw in process.stdout:
         if control.cancel.is_set():
             break
@@ -2742,7 +2949,45 @@ def stream_claude(session, user_text, model, emit, control):
                 backend["session_id"] = new_id
         elif event_type == "assistant":
             message = event.get("message") or {}
-            update_context(session, message.get("usage") or {}, message.get("model") or model)
+            turn_model = clean_text(message.get("model") or model)
+            update_context(session, message.get("usage") or {}, turn_model)
+
+            # Piece 3: establish primary model on the first assistant event;
+            # infer a subagent when model changes and no explicit worker is active.
+            if turn_model:
+                if not _primary_model:
+                    _primary_model = turn_model
+                elif turn_model != _primary_model and not _inflight_workers:
+                    # Model handoff — infer a subagent worker if not already tracked.
+                    inferred_id = f"model:{turn_model}"
+                    if _inferred_worker_id != inferred_id:
+                        # Clear any stale inferred worker first.
+                        if _inferred_worker_id:
+                            emit({
+                                "type": "work",
+                                "kind": "worker_done",
+                                "id": _inferred_worker_id,
+                                "content": _inferred_worker_id.split(":", 1)[-1],
+                            })
+                        _inferred_worker_id = inferred_id
+                        short_name = turn_model.split("-")[0] if "-" in turn_model else turn_model
+                        emit({
+                            "type": "work",
+                            "kind": "worker",
+                            "content": short_name,
+                            "model_inferred": True,
+                            "id": inferred_id,
+                        })
+                elif turn_model == _primary_model and _inferred_worker_id:
+                    # Model returned to primary — clear inferred worker.
+                    emit({
+                        "type": "work",
+                        "kind": "worker_done",
+                        "id": _inferred_worker_id,
+                        "content": _inferred_worker_id.split(":", 1)[-1],
+                    })
+                    _inferred_worker_id = ""
+
             for block in message.get("content") or []:
                 if not isinstance(block, dict):
                     continue
@@ -2769,18 +3014,50 @@ def stream_claude(session, user_text, model, emit, control):
                             or "Claude sub-agent"
                         )
                         worker_model = clean_text(tool_input.get("model"))
+                        label = (
+                            f"{worker_name} · {worker_model}"
+                            if worker_model
+                            else worker_name
+                        )
+                        tool_use_id = clean_text(block.get("id")) or str(uuid.uuid4())
+                        # Piece 2: record in-flight worker so we can close it.
+                        _inflight_workers[tool_use_id] = label
                         emit(
                             {
                                 "type": "work",
                                 "kind": "worker",
-                                "content": (
-                                    f"{worker_name} · {worker_model}"
-                                    if worker_model
-                                    else worker_name
-                                ),
+                                "content": label,
+                                "id": tool_use_id,
                             }
                         )
+        elif event_type == "user":
+            # Piece 2: a tool_result with parent_tool_use_id signals that the
+            # matching subagent has finished (mirrors OG ~line 3449).
+            message = event.get("message") or {}
+            for block in (message.get("content") or []):
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") != "tool_result":
+                    continue
+                parent_id = clean_text(block.get("tool_use_id") or "")
+                if parent_id and parent_id in _inflight_workers:
+                    label = _inflight_workers.pop(parent_id)
+                    emit({
+                        "type": "work",
+                        "kind": "worker_done",
+                        "id": parent_id,
+                        "content": label,
+                    })
         elif event_type == "result":
+            # Turn ended — clear any remaining inferred worker.
+            if _inferred_worker_id:
+                emit({
+                    "type": "work",
+                    "kind": "worker_done",
+                    "id": _inferred_worker_id,
+                    "content": _inferred_worker_id.split(":", 1)[-1],
+                })
+                _inferred_worker_id = ""
             result = clean_text(event.get("result"))
             if result and not full:
                 full.append(result)
@@ -3608,6 +3885,33 @@ class Handler(BaseHTTPRequestHandler):
                     request.get("token") or "",
                 )
                 self._json(200, value)
+            except Exception as error:
+                self._json(400, {"ok": False, "error": clean_text(error)})
+            return
+
+        if parsed.path == "/worker/spawn":
+            # POST /worker/spawn — request: {source_id, prompt, agent?, model?, effort?}
+            # response: {ok, session: {id, title, agent, model, effort,
+            #            worker_parent_session_id, worker_job_id}}
+            try:
+                session = spawn_worker_session(
+                    clean_text(request.get("source_id")),
+                    clean_text(request.get("prompt")),
+                    agent=clean_text(request.get("agent")),
+                    model=clean_text(request.get("model")),
+                    effort=clean_text(request.get("effort")),
+                )
+                self._json(200, {"ok": True, "session": session})
+            except Exception as error:
+                self._json(400, {"ok": False, "error": clean_text(error)})
+            return
+
+        if parsed.path == "/worker/list":
+            # POST /worker/list — request: {source_id}
+            # response: {ok, sessions: [...]}
+            try:
+                parent_id = clean_text(request.get("source_id"))
+                self._json(200, {"ok": True, "sessions": worker_sessions(parent_id)})
             except Exception as error:
                 self._json(400, {"ok": False, "error": clean_text(error)})
             return

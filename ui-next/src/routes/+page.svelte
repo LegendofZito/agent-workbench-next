@@ -5,12 +5,14 @@
   import { Archive, FileBox, MessageSquare, TerminalSquare } from "@lucide/svelte";
   import Artifacts from "$lib/components/Artifacts.svelte";
   import Composer from "$lib/components/Composer.svelte";
+  import ContextBanner from "$lib/components/ContextBanner.svelte";
   import Conversation from "$lib/components/Conversation.svelte";
   import HandoffDialog from "$lib/components/HandoffDialog.svelte";
   import OptionsDialog from "$lib/components/OptionsDialog.svelte";
   import SessionHeader from "$lib/components/SessionHeader.svelte";
   import Sidebar from "$lib/components/Sidebar.svelte";
   import Terminal from "$lib/components/Terminal.svelte";
+  import WorkerDialog from "$lib/components/WorkerDialog.svelte";
   import WorkLog from "$lib/components/WorkLog.svelte";
   import WorkspaceTabs from "$lib/components/WorkspaceTabs.svelte";
   import {
@@ -34,6 +36,7 @@
     saveAppPreferences,
     sendMessage,
     serverInfo,
+    spawnWorker,
     stageHandoff,
     stopTerminal,
     stopMessage,
@@ -95,7 +98,7 @@
   let busyBySession = $state<Record<string, boolean>>({});
   let startedAtBySession = $state<Record<string, number>>({});
   let tokensBySession = $state<Record<string, number>>({});
-  let workersBySession = $state<Record<string, string[]>>({});
+  let workersBySession = $state<Record<string, Array<{ id: string; label: string }>>>({});
   let limitsByAgent = $state<Record<string, UsageLimits>>({});
   let limitsLoading = $state(false);
   let refreshing = $state(false);
@@ -104,13 +107,15 @@
   let optionsOpen = $state(false);
   let optionsBusy = $state(false);
   let clientPickerOpen = $state(false);
+  let workerDialogOpen = $state(false);
+  let workerDialogBusy = $state(false);
   let attachPicking = $state(false);
   let notice = $state("");
   let clockTick = $state(Date.now());
   let sessionLoadSequence = 0;
   let persistTimer: number | undefined;
   const controllers = new Map<string, AbortController>();
-  const stagedSessions = new Set<string>();
+  const lastStagedSignature: Record<string, string> = {};
 
   const activeWorkspace = $derived(
     tabs.find((tab) => tab.id === activeWorkspaceId) ?? tabs[0],
@@ -143,7 +148,8 @@
       : 0,
   );
   const liveTokens = $derived(tokensBySession[selectedSessionId] ?? 0);
-  const activeWorkers = $derived(workersBySession[selectedSessionId] ?? []);
+  const activeWorkerItems = $derived(workersBySession[selectedSessionId] ?? []);
+  const activeWorkers = $derived(activeWorkerItems.map((w) => w.label));
   const activeStatusLabel = $derived.by(() => {
     const label =
       optionFor(activeWorkspace?.agentKey ?? "")?.label ??
@@ -728,7 +734,7 @@
     setBusy(sessionId, true);
     startedAtBySession = { ...startedAtBySession, [sessionId]: Date.now() };
     tokensBySession = { ...tokensBySession, [sessionId]: 0 };
-    workersBySession = { ...workersBySession, [sessionId]: [] };
+    workersBySession = { ...workersBySession, [sessionId]: [] as Array<{ id: string; label: string }> };
     const controller = new AbortController();
     controllers.set(sessionId, controller);
     let streamedCharacters = 0;
@@ -761,20 +767,29 @@
           item.id === sessionId ? { ...item, model } : item,
         );
       },
-      (type, content) => {
+      (type, content, workId) => {
         if (type === "worker") {
+          const existing = workersBySession[sessionId] ?? [];
+          const key = workId ?? content;
           workersBySession = {
             ...workersBySession,
-            [sessionId]: dedupe([
-              ...(workersBySession[sessionId] ?? []),
-              content,
-            ]),
+            [sessionId]: existing.some((w) => w.id === key)
+              ? existing
+              : [...existing, { id: key, label: content }],
+          };
+        } else if (type === "worker_done") {
+          const key = workId ?? content;
+          workersBySession = {
+            ...workersBySession,
+            [sessionId]: (workersBySession[sessionId] ?? []).filter(
+              (w) => w.id !== key,
+            ),
           };
         }
         const view = sessionViews[sessionId] ?? EMPTY_VIEW;
-        // Normalize "worker" to "report" to match how the server persists it,
-        // so live work-log entries look the same as replayed ones.
-        const logType = type === "worker" ? "report" : type;
+        // Normalize "worker"/"worker_done" to "report" to match how the server
+        // persists it, so live work-log entries look the same as replayed ones.
+        const logType = type === "worker" || type === "worker_done" ? "report" : type;
         updateSessionView(sessionId, {
           workLog: [
             ...view.workLog,
@@ -814,7 +829,7 @@
 
     controllers.delete(sessionId);
     setBusy(sessionId, false);
-    workersBySession = { ...workersBySession, [sessionId]: [] };
+    workersBySession = { ...workersBySession, [sessionId]: [] as Array<{ id: string; label: string }> };
     sessions = await listSessions().catch(() => sessions);
     await loadSessionView(sessionId, true);
 
@@ -898,7 +913,17 @@
       pendingAttachments: [],
       queuedPrompts: [],
     };
-    tabs = [...tabs, workspace];
+    // Insert the continuation tab right after the source tab (keep source open).
+    const sourceIdx = tabs.findIndex((t) => t.id === activeWorkspaceId);
+    if (sourceIdx >= 0) {
+      tabs = [
+        ...tabs.slice(0, sourceIdx + 1),
+        workspace,
+        ...tabs.slice(sourceIdx + 1),
+      ];
+    } else {
+      tabs = [...tabs, workspace];
+    }
     activeWorkspaceId = workspace.id;
     activeView = "conversation";
     handoffOpen = false;
@@ -931,6 +956,63 @@
       notice = `Handoff failed: ${String(error)}`;
     } finally {
       handoffBusy = false;
+    }
+  }
+
+  async function handleSpawnWorker(params: {
+    prompt: string;
+    agent: string;
+    model: string;
+    effort: string;
+  }) {
+    if (!selectedSession || workerDialogBusy) return;
+    workerDialogBusy = true;
+    try {
+      const workerSession = await spawnWorker({
+        source_id: selectedSession.id,
+        prompt: params.prompt,
+        agent: params.agent,
+        model: params.model,
+        effort: params.effort,
+      });
+      sessions = [
+        workerSession,
+        ...sessions.filter((s) => s.id !== workerSession.id),
+      ];
+      const workspace: WorkspaceTab = {
+        id: crypto.randomUUID(),
+        label: workerSession.title,
+        agent: workerSession.agent,
+        agentKey: workerSession.agentKey,
+        cwd: workerSession.cwd,
+        model: workerSession.model,
+        effort: workerSession.effort,
+        sessionId: workerSession.id,
+        draft: "",
+        pendingAttachments: [],
+        queuedPrompts: [],
+      };
+      // Insert the worker tab right after the current tab.
+      const sourceIdx = tabs.findIndex((t) => t.id === activeWorkspaceId);
+      if (sourceIdx >= 0) {
+        tabs = [
+          ...tabs.slice(0, sourceIdx + 1),
+          workspace,
+          ...tabs.slice(sourceIdx + 1),
+        ];
+      } else {
+        tabs = [...tabs, workspace];
+      }
+      activeWorkspaceId = workspace.id;
+      activeView = "conversation";
+      workerDialogOpen = false;
+      schedulePersist();
+      updateSessionView(workerSession.id, EMPTY_VIEW);
+      await runTurn(workerSession, params.prompt, []);
+    } catch (error) {
+      notice = `Spawn worker failed: ${String(error)}`;
+    } finally {
+      workerDialogBusy = false;
     }
   }
 
@@ -967,19 +1049,18 @@
     const session = selectedSession;
     const percent = session?.context?.percent ?? 0;
     const compactCount = session?.context?.compactCount ?? 0;
-    if (
-      session &&
-      (percent >= 70 || compactCount > 0) &&
-      !stagedSessions.has(session.id)
-    ) {
-      stagedSessions.add(session.id);
-      void stageHandoff(session.id)
-        .then(() => loadSessionView(session.id, true))
-        .catch((error) => {
-          stagedSessions.delete(session.id);
-          notice = `Could not stage handoff: ${String(error)}`;
-        });
-    }
+    if (!session || (percent < 70 && compactCount === 0)) return;
+    // Build a signature from the session's mutable fields so we re-stage
+    // whenever the session advances, not just on the first qualifying load.
+    const sig = `${session.updatedAtIso ?? ""}|${Math.round(percent)}|${compactCount}`;
+    if (lastStagedSignature[session.id] === sig) return;
+    lastStagedSignature[session.id] = sig;
+    void stageHandoff(session.id)
+      .then(() => loadSessionView(session.id, true))
+      .catch((error) => {
+        delete lastStagedSignature[session.id];
+        notice = `Could not stage handoff: ${String(error)}`;
+      });
   });
 
   $effect(() => {
@@ -1125,12 +1206,15 @@
         <SessionHeader
           session={displaySession}
           limits={currentLimits}
+          workers={activeWorkerItems}
+          queueCount={activeWorkspace?.queuedPrompts.length ?? 0}
           {limitsLoading}
           {refreshing}
           onlimits={loadLimits}
           onrefresh={refreshSessionsAndView}
           onhandoff={() => (handoffOpen = true)}
           onoptions={() => (optionsOpen = true)}
+          onspawnworker={() => (workerDialogOpen = true)}
         />
 
         <nav class="view-tabs" aria-label="Session views">
@@ -1144,6 +1228,11 @@
             </button>
           {/each}
         </nav>
+
+        <ContextBanner
+          percent={displaySession.context?.percent ?? 0}
+          compactCount={displaySession.context?.compactCount ?? 0}
+        />
 
         {#if notice}
           <button class="notice-bar" onclick={() => (notice = "")}>{notice}</button>
@@ -1189,6 +1278,13 @@
           onremovequeue={removeQueuedPrompt}
           onpasteimage={pasteImageAttachment}
           ondraft={(draft) => updateCurrentWorkspace({ draft })}
+          onqueue={(text) =>
+            updateCurrentWorkspace({
+              queuedPrompts: [
+                ...(activeWorkspace?.queuedPrompts ?? []),
+                { prompt: text, attachments: [] },
+              ],
+            })}
         />
       </section>
     {:else if !loaded}
@@ -1205,6 +1301,15 @@
     busy={handoffBusy}
     onclose={() => (handoffOpen = false)}
     ondeploy={deploySelectedHandoff}
+  />
+  <WorkerDialog
+    open={workerDialogOpen}
+    agents={agentOptions}
+    sourceAgentKey={activeWorkspace?.agentKey ?? "claude"}
+    sourceSessionId={selectedSessionId}
+    busy={workerDialogBusy}
+    onclose={() => (workerDialogOpen = false)}
+    onspawn={handleSpawnWorker}
   />
   <OptionsDialog
     open={optionsOpen}

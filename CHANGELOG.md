@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ---
 
 ## [Unreleased] - 2026-06-14
+- Worker delegation: spawn a bounded task to a cheaper model from any session (Delegate)
+- Smart orchestration parity: Haiku/Sonnet/Opus agent routing, cheaper-continuation, auto-deploy handoffs
+- Handoff is now a concise sectioned summary (overview, status, what went right/wrong, updates, commands, next steps) instead of a conversation copy
+- Handoff keeps the source session open and opens the continuation in the adjacent tab
+- Live sub-agent badge with start/stop tracking; 70%/85% context warning banner; queued prompts
 
 ### Features
 
